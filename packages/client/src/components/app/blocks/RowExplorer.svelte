@@ -11,6 +11,7 @@
   export let cardSubtitle
   export let cardDescription
   export let cardImageURL
+  export let size
 
   const stateKey = generate()
 
@@ -22,16 +23,15 @@
 </script>
 
 <Block>
-  <!-- seems like eject is unable to create two top-level components -->
   <BlockComponent
     type="container"
     props={{
       direction: "row",
+      size
     }}
     styles={{
       normal: {
-        width: "100%",
-        height: "600px",
+        "height": "100%"
       },
     }}
   >

@@ -5272,9 +5272,12 @@
     "name": "Row explorer block",
     "icon": "PersonalizationField",
     "size": {
-      "width": 600,
-      "height": 400
+      "width": 100,
+      "height": 100
     },
+    "styles": [
+      "size"
+    ],
     "settings": [
       {
         "type": "dataSource",
@@ -5322,9 +5325,11 @@
         ]
       }
     ],
-    "context": {
-      "type": "schema",
-      "suffix": "repeater"
-    }
+    "context": [
+      {
+        "type": "schema",
+        "suffix": "repeater"
+      }
+    ]
   }
 }

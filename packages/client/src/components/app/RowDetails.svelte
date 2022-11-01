@@ -141,7 +141,7 @@
 <style>
   .jsonViewer {
     width: 100%;
-    max-width: 100%;
+    resize: vertical;
   }
   .container {
     padding: 20px 30px;
