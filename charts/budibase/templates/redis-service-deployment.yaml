@@ -50,6 +50,9 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
     {{- end }}
+      {{ if .Values.schedulerName }}
+      schedulerName: {{ .Values.schedulerName | quote }}
+      {{ end }}
       {{ if .Values.imagePullSecrets }}
       imagePullSecrets:
       {{- toYaml .Values.imagePullSecrets | nindent 6 }}
@@ -60,5 +63,6 @@ spec:
       - name: redis-data
         persistentVolumeClaim:
           claimName: redis-data
+
 status: {}
 {{- end }}

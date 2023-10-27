@@ -1,8 +1,10 @@
 import { Operation, SortDirection } from "./datasources"
 import { Row, Table } from "../documents"
+import { SortType } from "../api"
 
 export interface SearchFilters {
   allOr?: boolean
+  onEmptyFilter?: EmptyFilterOption
   string?: {
     [key: string]: string
   }
@@ -31,7 +33,7 @@ export interface SearchFilters {
     [key: string]: any[]
   }
   contains?: {
-    [key: string]: any[]
+    [key: string]: any[] | any
   }
   notContains?: {
     [key: string]: any[]
@@ -42,7 +44,10 @@ export interface SearchFilters {
 }
 
 export interface SortJson {
-  [key: string]: SortDirection
+  [key: string]: {
+    direction: SortDirection
+    type?: SortType
+  }
 }
 
 export interface PaginationJson {
@@ -72,7 +77,7 @@ export interface QueryJson {
     operation: Operation
     schema?: string
   }
-  resource: {
+  resource?: {
     fields: string[]
   }
   filters?: SearchFilters
@@ -83,7 +88,7 @@ export interface QueryJson {
   meta?: {
     table?: Table
     tables?: Record<string, Table>
-    renamed: RenameColumn
+    renamed?: RenameColumn
   }
   extra?: {
     idFilter?: SearchFilters
@@ -94,4 +99,9 @@ export interface QueryJson {
 export interface SqlQuery {
   sql: string
   bindings?: string[]
+}
+
+export enum EmptyFilterOption {
+  RETURN_ALL = "all",
+  RETURN_NONE = "none",
 }

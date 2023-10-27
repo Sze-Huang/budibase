@@ -1,10 +1,9 @@
 import path from "path"
-import * as env from "./environment"
+import env from "./environment"
 import chokidar from "chokidar"
 import fs from "fs"
-import { tenancy } from "@budibase/backend-core"
-import { DEFAULT_TENANT_ID } from "@budibase/backend-core/constants"
-import { processUploadedPlugin } from "./api/controllers/plugin"
+import { constants, tenancy } from "@budibase/backend-core"
+import pluginsSdk from "./sdk/plugins"
 
 export function watch() {
   const watchPath = path.join(env.PLUGINS_DIR, "./**/*.tar.gz")
@@ -23,12 +22,12 @@ export function watch() {
       if (!path?.endsWith(".tar.gz") || !fs.existsSync(path)) {
         return
       }
-      await tenancy.doInTenant(DEFAULT_TENANT_ID, async () => {
+      await tenancy.doInTenant(constants.DEFAULT_TENANT_ID, async () => {
         try {
           const split = path.split("/")
           const name = split[split.length - 1]
           console.log("Importing plugin:", path)
-          await processUploadedPlugin({ name, path })
+          await pluginsSdk.processUploaded({ name, path })
         } catch (err: any) {
           const message = err?.message ? err?.message : err
           console.error("Failed to import plugin:", message)

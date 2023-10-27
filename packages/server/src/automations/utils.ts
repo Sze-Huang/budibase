@@ -4,45 +4,61 @@ import { automationQueue } from "./bullboard"
 import newid from "../db/newid"
 import { updateEntityMetadata } from "../utilities"
 import { MetadataTypes } from "../constants"
-import { getProdAppID, doWithDB } from "@budibase/backend-core/db"
+import { db as dbCore, context } from "@budibase/backend-core"
 import { getAutomationMetadataParams } from "../db/utils"
 import { cloneDeep } from "lodash/fp"
-import {
-  getAppDB,
-  getAppId,
-  getProdAppDB,
-} from "@budibase/backend-core/context"
-import { context } from "@budibase/backend-core"
 import { quotas } from "@budibase/pro"
-import { Automation, WebhookActionType } from "@budibase/types"
+import {
+  Automation,
+  AutomationJob,
+  Webhook,
+  WebhookActionType,
+} from "@budibase/types"
 import sdk from "../sdk"
+import { automationsEnabled } from "../features"
 
 const REBOOT_CRON = "@reboot"
 const WH_STEP_ID = definitions.WEBHOOK.stepId
 const CRON_STEP_ID = definitions.CRON.stepId
-const Runner = new Thread(ThreadType.AUTOMATION)
-
-const jobMessage = (job: any, message: string) => {
-  return `app=${job.data.event.appId} automation=${job.data.automation._id} jobId=${job.id} trigger=${job.data.automation.definition.trigger.event} : ${message}`
+let Runner: Thread
+if (automationsEnabled()) {
+  Runner = new Thread(ThreadType.AUTOMATION)
 }
 
-export async function processEvent(job: any) {
-  try {
-    const automationId = job.data.automation._id
-    console.log(jobMessage(job, "running"))
-    // need to actually await these so that an error can be captured properly
-    return await context.doInContext(job.data.event.appId, async () => {
+function loggingArgs(job: AutomationJob) {
+  return [
+    {
+      _logKey: "automation",
+      trigger: job.data.automation.definition.trigger.event,
+    },
+    {
+      _logKey: "bull",
+      jobId: job.id,
+    },
+  ]
+}
+
+export async function processEvent(job: AutomationJob) {
+  const appId = job.data.event.appId!
+  const automationId = job.data.automation._id!
+  const task = async () => {
+    try {
+      // need to actually await these so that an error can be captured properly
+      console.log("automation running", ...loggingArgs(job))
+
       const runFn = () => Runner.run(job)
-      return quotas.addAutomation(runFn, {
+      const result = await quotas.addAutomation(runFn, {
         automationId,
       })
-    })
-  } catch (err) {
-    const errJson = JSON.stringify(err)
-    console.error(jobMessage(job, `was unable to run - ${errJson}`))
-    console.trace(err)
-    return { err }
+      console.log("automation completed", ...loggingArgs(job))
+      return result
+    } catch (err) {
+      console.error(`automation was unable to run`, err, ...loggingArgs(job))
+      return { err }
+    }
   }
+
+  return await context.doInAutomationContext({ appId, automationId, task })
 }
 
 export async function updateTestHistory(
@@ -88,7 +104,8 @@ export async function disableAllCrons(appId: any) {
       }
     }
   }
-  return Promise.all(promises)
+  const results = await Promise.all(promises)
+  return { count: results.length / 2 }
 }
 
 export async function disableCronById(jobId: number | string) {
@@ -102,7 +119,7 @@ export async function disableCronById(jobId: number | string) {
 }
 
 export async function clearMetadata() {
-  const db = getProdAppDB()
+  const db = context.getProdAppDB()
   const automationMetadata = (
     await db.allDocs(
       getAutomationMetadataParams({
@@ -136,6 +153,7 @@ export function isRebootTrigger(auto: Automation) {
  */
 export async function enableCronTrigger(appId: any, automation: Automation) {
   const trigger = automation ? automation.definition.trigger : null
+  let enabled = false
 
   // need to create cron job
   if (
@@ -157,13 +175,14 @@ export async function enableCronTrigger(appId: any, automation: Automation) {
     // can't use getAppDB here as this is likely to be called from dev app,
     // but this call could be for dev app or prod app, need to just use what
     // was passed in
-    await doWithDB(appId, async (db: any) => {
+    await dbCore.doWithDB(appId, async (db: any) => {
       const response = await db.put(automation)
       automation._id = response.id
       automation._rev = response.rev
     })
+    enabled = true
   }
-  return automation
+  return { enabled, automation }
 }
 
 /**
@@ -175,7 +194,10 @@ export async function enableCronTrigger(appId: any, automation: Automation) {
  * written to DB (this does not write to DB as it would be wasteful to repeat).
  */
 export async function checkForWebhooks({ oldAuto, newAuto }: any) {
-  const appId = getAppId()
+  const appId = context.getAppId()
+  if (!appId) {
+    throw new Error("Unable to check webhooks - no app ID in context.")
+  }
   const oldTrigger = oldAuto ? oldAuto.definition.trigger : null
   const newTrigger = newAuto ? newAuto.definition.trigger : null
   const triggerChanged =
@@ -194,15 +216,15 @@ export async function checkForWebhooks({ oldAuto, newAuto }: any) {
     oldTrigger.webhookId
   ) {
     try {
-      let db = getAppDB()
+      const db = context.getAppDB()
       // need to get the webhook to get the rev
-      const webhook = await db.get(oldTrigger.webhookId)
+      const webhook = await db.get<Webhook>(oldTrigger.webhookId)
       // might be updating - reset the inputs to remove the URLs
       if (newTrigger) {
         delete newTrigger.webhookId
         newTrigger.inputs = {}
       }
-      await sdk.automations.webhook.destroy(webhook._id, webhook._rev)
+      await sdk.automations.webhook.destroy(webhook._id!, webhook._rev!)
     } catch (err) {
       // don't worry about not being able to delete, if it doesn't exist all good
     }
@@ -224,7 +246,7 @@ export async function checkForWebhooks({ oldAuto, newAuto }: any) {
     // the app ID has to be development for this endpoint
     // it can only be used when building the app
     // but the trigger endpoint will always be used in production
-    const prodAppId = getProdAppID(appId)
+    const prodAppId = dbCore.getProdAppID(appId)
     newTrigger.inputs = {
       schemaUrl: `api/webhooks/schema/${appId}/${id}`,
       triggerUrl: `api/webhooks/trigger/${prodAppId}/${id}`,

@@ -10,13 +10,14 @@ declare -a DOCKER_VARS=("APP_PORT" "APPS_URL" "ARCHITECTURE" "BUDIBASE_ENVIRONME
 [[ -z "${MINIO_URL}" ]] && export MINIO_URL=http://localhost:9000
 [[ -z "${NODE_ENV}" ]] && export NODE_ENV=production
 [[ -z "${POSTHOG_TOKEN}" ]] && export POSTHOG_TOKEN=phc_bIjZL7oh2GEUd2vqvTBH8WvrX0fWTFQMs6H5KQxiUxU
-[[ -z "${TENANT_FEATURE_FLAGS}" ]] && export TENANT_FEATURE_FLAGS="*:LICENSING,*:USER_GROUPS"
+[[ -z "${TENANT_FEATURE_FLAGS}" ]] && export TENANT_FEATURE_FLAGS="*:LICENSING,*:USER_GROUPS,*:ONBOARDING_TOUR"
 [[ -z "${ACCOUNT_PORTAL_URL}" ]] && export ACCOUNT_PORTAL_URL=https://account.budibase.app
 [[ -z "${REDIS_URL}" ]] && export REDIS_URL=localhost:6379
 [[ -z "${SELF_HOSTED}" ]] && export SELF_HOSTED=1
 [[ -z "${WORKER_PORT}" ]] && export WORKER_PORT=4002
 [[ -z "${WORKER_URL}" ]] && export WORKER_URL=http://localhost:4002
 [[ -z "${APPS_URL}" ]] && export APPS_URL=http://localhost:4001
+[[ -z "${SERVER_TOP_LEVEL_PATH}" ]] && export SERVER_TOP_LEVEL_PATH=/app
 #  export CUSTOM_DOMAIN=budi001.custom.com
 
 # Azure App Service customisations
@@ -27,12 +28,14 @@ if [[ "${TARGETBUILD}" = "aas" ]]; then
 else
     DATA_DIR=${DATA_DIR:-/data}
 fi
-
+mkdir -p ${DATA_DIR}
 # Mount NFS or GCP Filestore if env vars exist for it
-if [[ -z ${FILESHARE_IP} && -z ${FILESHARE_NAME} ]]; then
+if [[ ! -z ${FILESHARE_IP} && ! -z ${FILESHARE_NAME} ]]; then
+    echo "Mounting NFS share"
+    apt update && apt install -y nfs-common nfs-kernel-server
     echo "Mount file share ${FILESHARE_IP}:/${FILESHARE_NAME} to ${DATA_DIR}"
     mount -o nolock ${FILESHARE_IP}:/${FILESHARE_NAME} ${DATA_DIR}
-    echo "Mounting completed."
+    echo "Mounting result: $?"
 fi
 
 if [ -f "${DATA_DIR}/.env" ]; then
@@ -70,14 +73,11 @@ for LINE in $(cat ${DATA_DIR}/.env); do export $LINE; done
 ln -s ${DATA_DIR}/.env /app/.env
 ln -s ${DATA_DIR}/.env /worker/.env
 # make these directories in runner, incase of mount
-mkdir -p ${DATA_DIR}/couch/{dbs,views}
 mkdir -p ${DATA_DIR}/minio
-mkdir -p ${DATA_DIR}/search
 chown -R couchdb:couchdb ${DATA_DIR}/couch
-redis-server --requirepass $REDIS_PASSWORD &
-/opt/clouseau/bin/clouseau &
-/minio/minio server ${DATA_DIR}/minio &
-/docker-entrypoint.sh /opt/couchdb/bin/couchdb &
+redis-server --requirepass $REDIS_PASSWORD > /dev/stdout 2>&1 &
+/bbcouch-runner.sh &
+/minio/minio server --console-address ":9001" ${DATA_DIR}/minio > /dev/stdout 2>&1 &
 /etc/init.d/nginx restart
 if [[ ! -z "${CUSTOM_DOMAIN}" ]]; then
     # Add monthly cron job to renew certbot certificate
@@ -85,16 +85,17 @@ if [[ ! -z "${CUSTOM_DOMAIN}" ]]; then
     chmod +x /etc/cron.d/certificate-renew
     # Request the certbot certificate
     /app/letsencrypt/certificate-request.sh ${CUSTOM_DOMAIN}
+    /etc/init.d/nginx restart
 fi
 
-/etc/init.d/nginx restart
+# wait for backend services to start
+sleep 10
+
 pushd app
-pm2 start --name app "yarn run:docker"
+pm2 start -l /dev/stdout --name app "yarn run:docker"
 popd
 pushd worker
-pm2 start --name worker "yarn run:docker"
+pm2 start -l /dev/stdout --name worker "yarn run:docker"
 popd
-sleep 10
-curl -X PUT ${COUCH_DB_URL}/_users
-curl -X PUT ${COUCH_DB_URL}/_replicator
+echo "end of runner.sh, sleeping ..."
 sleep infinity

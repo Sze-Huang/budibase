@@ -29,6 +29,7 @@
   export let cardButtonText
   export let cardButtonOnClick
   export let linkColumn
+  export let noRowsMessage
 
   const { fetchDatasourceSchema } = getContext("sdk")
 
@@ -36,10 +37,13 @@
   let dataProviderId
   let repeaterId
   let schema
+  let enrichedSearchColumns
   let schemaLoaded = false
 
   $: fetchSchema(dataSource)
-  $: enrichedSearchColumns = enrichSearchColumns(searchColumns, schema)
+  $: enrichSearchColumns(searchColumns, schema).then(
+    val => (enrichedSearchColumns = val)
+  )
   $: enrichedFilter = enrichFilter(filter, enrichedSearchColumns, formId)
   $: cardWidth = cardHorizontal ? 420 : 300
   $: fullCardURL = buildFullCardUrl(
@@ -122,7 +126,7 @@
             order={1}
           >
             {#if enrichedSearchColumns?.length}
-              {#each enrichedSearchColumns as column, idx}
+              {#each enrichedSearchColumns as column, idx (column.name)}
                 <BlockComponent
                   type={column.componentType}
                   props={{
@@ -177,7 +181,7 @@
             hAlign: "stretch",
             vAlign: "top",
             gap: "M",
-            noRowsMessage: "No rows found",
+            noRowsMessage: noRowsMessage || "No rows found",
           }}
           styles={{
             custom: `display: grid;\ngrid-template-columns: repeat(auto-fill, minmax(min(${cardWidth}px, 100%), 1fr));`,

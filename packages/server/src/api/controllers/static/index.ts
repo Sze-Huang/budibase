@@ -1,32 +1,27 @@
-import { enrichPluginURLs } from "../../../utilities/plugins"
-
 require("svelte/register")
 
-const send = require("koa-send")
-const { resolve, join } = require("../../../utilities/centralPath")
-const uuid = require("uuid")
-const { ObjectStoreBuckets } = require("../../../constants")
-const { processString } = require("@budibase/string-templates")
-const {
+import { join } from "../../../utilities/centralPath"
+import uuid from "uuid"
+import { ObjectStoreBuckets } from "../../../constants"
+import { processString } from "@budibase/string-templates"
+import {
   loadHandlebarsFile,
   NODE_MODULES_PATH,
   TOP_LEVEL_PATH,
-} = require("../../../utilities/fileSystem")
-const env = require("../../../environment")
-const { clientLibraryPath } = require("../../../utilities")
-const { upload, deleteFiles } = require("../../../utilities/fileSystem")
-const { attachmentsRelativeURL } = require("../../../utilities")
-const { DocumentType } = require("../../../db/utils")
-const { getAppDB, getAppId } = require("@budibase/backend-core/context")
-const { setCookie, clearCookie } = require("@budibase/backend-core/utils")
-const AWS = require("aws-sdk")
-const fs = require("fs")
-const {
-  downloadTarballDirect,
-} = require("../../../utilities/fileSystem/utilities")
+} from "../../../utilities/fileSystem"
+import env from "../../../environment"
+import { DocumentType } from "../../../db/utils"
+import { context, objectStore, utils, configs } from "@budibase/backend-core"
+import AWS from "aws-sdk"
+import fs from "fs"
+import sdk from "../../../sdk"
+import * as pro from "@budibase/pro"
+import { App } from "@budibase/types"
+
+const send = require("koa-send")
 
 async function prepareUpload({ s3Key, bucket, metadata, file }: any) {
-  const response = await upload({
+  const response = await objectStore.upload({
     bucket,
     metadata,
     filename: s3Key,
@@ -38,7 +33,7 @@ async function prepareUpload({ s3Key, bucket, metadata, file }: any) {
   return {
     size: file.size,
     name: file.name,
-    url: attachmentsRelativeURL(response.Key),
+    url: objectStore.getAppFileUrl(s3Key),
     extension: [...file.name.split(".")].pop(),
     key: response.Key,
   }
@@ -48,24 +43,24 @@ export const toggleBetaUiFeature = async function (ctx: any) {
   const cookieName = `beta:${ctx.params.feature}`
 
   if (ctx.cookies.get(cookieName)) {
-    clearCookie(ctx, cookieName)
+    utils.clearCookie(ctx, cookieName)
     ctx.body = {
       message: `${ctx.params.feature} disabled`,
     }
     return
   }
 
-  let builderPath = resolve(TOP_LEVEL_PATH, "new_design_ui")
+  let builderPath = join(TOP_LEVEL_PATH, "new_design_ui")
 
   // // download it from S3
   if (!fs.existsSync(builderPath)) {
     fs.mkdirSync(builderPath)
   }
-  await downloadTarballDirect(
+  await objectStore.downloadTarballDirect(
     "https://cdn.budi.live/beta:design_ui/new_ui.tar.gz",
     builderPath
   )
-  setCookie(ctx, {}, cookieName)
+  utils.setCookie(ctx, {}, cookieName)
 
   ctx.body = {
     message: `${ctx.params.feature} enabled`,
@@ -73,7 +68,7 @@ export const toggleBetaUiFeature = async function (ctx: any) {
 }
 
 export const serveBuilder = async function (ctx: any) {
-  const builderPath = resolve(TOP_LEVEL_PATH, "builder")
+  const builderPath = join(TOP_LEVEL_PATH, "builder")
   await send(ctx, ctx.file, { root: builderPath })
 }
 
@@ -90,7 +85,7 @@ export const uploadFile = async function (ctx: any) {
 
     return prepareUpload({
       file,
-      s3Key: `${ctx.appId}/attachments/${processedFileName}`,
+      s3Key: `${context.getProdAppId()}/attachments/${processedFileName}`,
       bucket: ObjectStoreBuckets.APPS,
     })
   })
@@ -99,49 +94,102 @@ export const uploadFile = async function (ctx: any) {
 }
 
 export const deleteObjects = async function (ctx: any) {
-  ctx.body = await deleteFiles(ObjectStoreBuckets.APPS, ctx.request.body.keys)
+  ctx.body = await objectStore.deleteFiles(
+    ObjectStoreBuckets.APPS,
+    ctx.request.body.keys
+  )
 }
 
 export const serveApp = async function (ctx: any) {
-  const db = getAppDB({ skip_setup: true })
-  const appInfo = await db.get(DocumentType.APP_METADATA)
-  let appId = getAppId()
+  const bbHeaderEmbed =
+    ctx.request.get("x-budibase-embed")?.toLowerCase() === "true"
 
-  if (!env.isJest()) {
-    const App = require("./templates/BudibaseApp.svelte").default
-    const plugins = enrichPluginURLs(appInfo.usedPlugins)
-    const { head, html, css } = App.render({
-      metaImage:
-        "https://res.cloudinary.com/daog6scxm/image/upload/v1666109324/meta-images/budibase-meta-image_uukc1m.png",
-      title: appInfo.name,
-      production: env.isProd(),
-      appId,
-      clientLibPath: clientLibraryPath(appId, appInfo.version, ctx),
-      usedPlugins: plugins,
-    })
+  //Public Settings
+  const { config } = await configs.getSettingsConfigDoc()
+  const branding = await pro.branding.getBrandingConfig(config)
+  // incase running direct from TS
+  let appHbsPath = join(__dirname, "app.hbs")
+  if (!fs.existsSync(appHbsPath)) {
+    appHbsPath = join(__dirname, "templates", "app.hbs")
+  }
 
-    const appHbs = loadHandlebarsFile(`${__dirname}/templates/app.hbs`)
-    ctx.body = await processString(appHbs, {
-      head,
-      body: html,
-      style: css.code,
-      appId,
-    })
-  } else {
-    // just return the app info for jest to assert on
-    ctx.body = appInfo
+  let db
+  try {
+    db = context.getAppDB({ skip_setup: true })
+    const appInfo = await db.get<any>(DocumentType.APP_METADATA)
+    let appId = context.getAppId()
+
+    if (!env.isJest()) {
+      const App = require("./templates/BudibaseApp.svelte").default
+      const plugins = objectStore.enrichPluginURLs(appInfo.usedPlugins)
+      const { head, html, css } = App.render({
+        metaImage:
+          branding?.metaImageUrl ||
+          "https://res.cloudinary.com/daog6scxm/image/upload/v1666109324/meta-images/budibase-meta-image_uukc1m.png",
+        metaDescription: branding?.metaDescription || "",
+        metaTitle:
+          branding?.metaTitle || `${appInfo.name} - built with Budibase`,
+        title: appInfo.name,
+        production: env.isProd(),
+        appId,
+        clientLibPath: objectStore.clientLibraryUrl(appId!, appInfo.version),
+        usedPlugins: plugins,
+        favicon:
+          branding.faviconUrl !== ""
+            ? objectStore.getGlobalFileUrl("settings", "faviconUrl")
+            : "",
+        logo:
+          config?.logoUrl !== ""
+            ? objectStore.getGlobalFileUrl("settings", "logoUrl")
+            : "",
+      })
+      const appHbs = loadHandlebarsFile(appHbsPath)
+      ctx.body = await processString(appHbs, {
+        head,
+        body: html,
+        style: css.code,
+        appId,
+        embedded: bbHeaderEmbed,
+      })
+    } else {
+      // just return the app info for jest to assert on
+      ctx.body = appInfo
+    }
+  } catch (error) {
+    if (!env.isJest()) {
+      const App = require("./templates/BudibaseApp.svelte").default
+      const { head, html, css } = App.render({
+        title: branding?.metaTitle,
+        metaTitle: branding?.metaTitle,
+        metaImage:
+          branding?.metaImageUrl ||
+          "https://res.cloudinary.com/daog6scxm/image/upload/v1666109324/meta-images/budibase-meta-image_uukc1m.png",
+        metaDescription: branding?.metaDescription || "",
+        favicon:
+          branding.faviconUrl !== ""
+            ? objectStore.getGlobalFileUrl("settings", "faviconUrl")
+            : "",
+      })
+
+      const appHbs = loadHandlebarsFile(appHbsPath)
+      ctx.body = await processString(appHbs, {
+        head,
+        body: html,
+        style: css.code,
+      })
+    }
   }
 }
 
 export const serveBuilderPreview = async function (ctx: any) {
-  const db = getAppDB({ skip_setup: true })
-  const appInfo = await db.get(DocumentType.APP_METADATA)
+  const db = context.getAppDB({ skip_setup: true })
+  const appInfo = await db.get<App>(DocumentType.APP_METADATA)
 
   if (!env.isJest()) {
-    let appId = getAppId()
-    const previewHbs = loadHandlebarsFile(`${__dirname}/templates/preview.hbs`)
+    let appId = context.getAppId()
+    const previewHbs = loadHandlebarsFile(`${__dirname}/preview.hbs`)
     ctx.body = await processString(previewHbs, {
-      clientLibPath: clientLibraryPath(appId, appInfo.version, ctx),
+      clientLibPath: objectStore.clientLibraryUrl(appId!, appInfo.version),
     })
   } else {
     // just return the app info for jest to assert on
@@ -150,19 +198,22 @@ export const serveBuilderPreview = async function (ctx: any) {
 }
 
 export const serveClientLibrary = async function (ctx: any) {
+  let rootPath = join(NODE_MODULES_PATH, "@budibase", "client", "dist")
+  // incase running from TS directly
+  if (env.isDev() && !fs.existsSync(rootPath)) {
+    rootPath = join(require.resolve("@budibase/client"), "..")
+  }
   return send(ctx, "budibase-client.js", {
-    root: join(NODE_MODULES_PATH, "@budibase", "client", "dist"),
+    root: rootPath,
   })
 }
 
 export const getSignedUploadURL = async function (ctx: any) {
-  const database = getAppDB()
-
   // Ensure datasource is valid
   let datasource
   try {
     const { datasourceId } = ctx.params
-    datasource = await database.get(datasourceId)
+    datasource = await sdk.datasources.get(datasourceId, { enriched: true })
     if (!datasource) {
       ctx.throw(400, "The specified datasource could not be found")
     }
@@ -178,8 +229,8 @@ export const getSignedUploadURL = async function (ctx: any) {
   // Determine type of datasource and generate signed URL
   let signedUrl
   let publicUrl
-  const awsRegion = datasource?.config?.region || "eu-west-1"
-  if (datasource.source === "S3") {
+  const awsRegion = (datasource?.config?.region || "eu-west-1") as string
+  if (datasource?.source === "S3") {
     const { bucket, key } = ctx.request.body || {}
     if (!bucket || !key) {
       ctx.throw(400, "bucket and key values are required")
@@ -188,8 +239,8 @@ export const getSignedUploadURL = async function (ctx: any) {
     try {
       const s3 = new AWS.S3({
         region: awsRegion,
-        accessKeyId: datasource?.config?.accessKeyId,
-        secretAccessKey: datasource?.config?.secretAccessKey,
+        accessKeyId: datasource?.config?.accessKeyId as string,
+        secretAccessKey: datasource?.config?.secretAccessKey as string,
         apiVersion: "2006-03-01",
         signatureVersion: "v4",
       })

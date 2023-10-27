@@ -1,38 +1,21 @@
-const jwt = require("./passport/jwt")
-const local = require("./passport/local")
-const google = require("./passport/google")
-const oidc = require("./passport/oidc")
-const { authError, ssoCallbackUrl } = require("./passport/utils")
-const authenticated = require("./authenticated")
-const auditLog = require("./auditLog")
-const tenancy = require("./tenancy")
-const internalApi = require("./internalApi")
-const datasourceGoogle = require("./passport/datasource/google")
-const csrf = require("./csrf")
-const adminOnly = require("./adminOnly")
-const builderOrAdmin = require("./builderOrAdmin")
-const builderOnly = require("./builderOnly")
-const joiValidator = require("./joi-validator")
-
-const pkg = {
-  google,
-  oidc,
-  jwt,
-  local,
-  authenticated,
-  auditLog,
-  tenancy,
-  authError,
-  internalApi,
-  ssoCallbackUrl,
-  datasource: {
-    google: datasourceGoogle,
-  },
-  csrf,
-  adminOnly,
-  builderOnly,
-  builderOrAdmin,
-  joiValidator,
+export * as local from "./passport/local"
+export * as google from "./passport/sso/google"
+export * as oidc from "./passport/sso/oidc"
+import * as datasourceGoogle from "./passport/datasource/google"
+export const datasource = {
+  google: datasourceGoogle,
 }
-
-export = pkg
+export { authError, ssoCallbackUrl } from "./passport/utils"
+export { default as authenticated } from "./authenticated"
+export { default as auditLog } from "./auditLog"
+export { default as tenancy } from "./tenancy"
+export { default as internalApi } from "./internalApi"
+export { default as csrf } from "./csrf"
+export { default as adminOnly } from "./adminOnly"
+export { default as builderOrAdmin } from "./builderOrAdmin"
+export { default as builderOnly } from "./builderOnly"
+export { default as pino } from "../logging/pino/middleware"
+export { default as correlation } from "../logging/correlation/middleware"
+export { default as errorHandling } from "./errorHandling"
+export { default as querystringToBody } from "./querystringToBody"
+export * as joiValidator from "./joi-validator"

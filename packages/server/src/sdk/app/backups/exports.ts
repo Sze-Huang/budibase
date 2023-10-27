@@ -1,36 +1,44 @@
-import { db as dbCore } from "@budibase/backend-core"
+import { db as dbCore, encryption, objectStore } from "@budibase/backend-core"
 import { budibaseTempDir } from "../../../utilities/budibaseDir"
-import { retrieveDirectory } from "../../../utilities/fileSystem/utilities"
 import { streamFile, createTempFolder } from "../../../utilities/fileSystem"
 import { ObjectStoreBuckets } from "../../../constants"
 import {
+  AUTOMATION_LOG_PREFIX,
   LINK_USER_METADATA_PREFIX,
   TABLE_ROW_PREFIX,
   USER_METDATA_PREFIX,
 } from "../../../db/utils"
-import { DB_EXPORT_FILE, GLOBAL_DB_EXPORT_FILE } from "./constants"
+import { DB_EXPORT_FILE, STATIC_APP_FILES } from "./constants"
 import fs from "fs"
 import { join } from "path"
 import env from "../../../environment"
+
 const uuid = require("uuid/v4")
-const tar = require("tar")
+import tar from "tar"
+
 const MemoryStream = require("memorystream")
 
-type ExportOpts = {
+export interface DBDumpOpts {
   filter?: any
   exportPath?: string
+}
+
+export interface ExportOpts extends DBDumpOpts {
   tar?: boolean
   excludeRows?: boolean
+  excludeLogs?: boolean
+  encryptPassword?: string
 }
 
 function tarFilesToTmp(tmpDir: string, files: string[]) {
-  const exportFile = join(budibaseTempDir(), `${uuid()}.tar.gz`)
+  const fileName = `${uuid()}.tar.gz`
+  const exportFile = join(budibaseTempDir(), fileName)
   tar.create(
     {
       sync: true,
       gzip: true,
       file: exportFile,
-      recursive: true,
+      noDirRecurse: false,
       cwd: tmpDir,
     },
     files
@@ -45,13 +53,22 @@ function tarFilesToTmp(tmpDir: string, files: string[]) {
  * a filter function or the name of the export.
  * @return {*} either a readable stream or a string
  */
-export async function exportDB(dbName: string, opts: ExportOpts = {}) {
+export async function exportDB(
+  dbName: string,
+  opts: DBDumpOpts = {}
+): Promise<string> {
+  const exportOpts = {
+    filter: opts?.filter,
+    batch_size: 1000,
+    batch_limit: 5,
+    style: "main_only",
+  }
   return dbCore.doWithDB(dbName, async (db: any) => {
     // Write the dump to file if required
     if (opts?.exportPath) {
       const path = opts?.exportPath
       const writeStream = fs.createWriteStream(path)
-      await db.dump(writeStream, { filter: opts?.filter })
+      await db.dump(writeStream, exportOpts)
       return path
     } else {
       // Stringify the dump in memory if required
@@ -60,16 +77,19 @@ export async function exportDB(dbName: string, opts: ExportOpts = {}) {
       memStream.on("data", (chunk: any) => {
         appString += chunk.toString()
       })
-      await db.dump(memStream, { filter: opts?.filter })
+      await db.dump(memStream, exportOpts)
       return appString
     }
   })
 }
 
-function defineFilter(excludeRows?: boolean) {
+function defineFilter(excludeRows?: boolean, excludeLogs?: boolean) {
   const ids = [USER_METDATA_PREFIX, LINK_USER_METADATA_PREFIX]
   if (excludeRows) {
     ids.push(TABLE_ROW_PREFIX)
+  }
+  if (excludeLogs) {
+    ids.push(AUTOMATION_LOG_PREFIX)
   }
   return (doc: any) =>
     !ids.map(key => doc._id.includes(key)).reduce((prev, curr) => prev || curr)
@@ -86,12 +106,27 @@ export async function exportApp(appId: string, config?: ExportOpts) {
   const prodAppId = dbCore.getProdAppID(appId)
   const appPath = `${prodAppId}/`
   // export bucket contents
-  let tmpPath
+  let tmpPath = createTempFolder(uuid())
   if (!env.isTest()) {
-    tmpPath = await retrieveDirectory(ObjectStoreBuckets.APPS, appPath)
-  } else {
-    tmpPath = createTempFolder(uuid())
+    // write just the static files
+    if (config?.excludeRows) {
+      for (let path of STATIC_APP_FILES) {
+        const contents = await objectStore.retrieve(
+          ObjectStoreBuckets.APPS,
+          join(appPath, path)
+        )
+        fs.writeFileSync(join(tmpPath, path), contents)
+      }
+    }
+    // get all of the files
+    else {
+      tmpPath = await objectStore.retrieveDirectory(
+        ObjectStoreBuckets.APPS,
+        appPath
+      )
+    }
   }
+
   const downloadedPath = join(tmpPath, appPath)
   if (fs.existsSync(downloadedPath)) {
     const allFiles = fs.readdirSync(downloadedPath)
@@ -106,16 +141,30 @@ export async function exportApp(appId: string, config?: ExportOpts) {
   // enforce an export of app DB to the tmp path
   const dbPath = join(tmpPath, DB_EXPORT_FILE)
   await exportDB(appId, {
-    ...config,
-    filter: defineFilter(config?.excludeRows),
+    filter: defineFilter(config?.excludeRows, config?.excludeLogs),
     exportPath: dbPath,
   })
+
+  if (config?.encryptPassword) {
+    for (let file of fs.readdirSync(tmpPath)) {
+      const path = join(tmpPath, file)
+
+      await encryption.encryptFile(
+        { dir: tmpPath, filename: file },
+        config.encryptPassword
+      )
+
+      fs.rmSync(path)
+    }
+  }
+
   // if tar requested, return where the tarball is
   if (config?.tar) {
     // now the tmpPath contains both the DB export and attachments, tar this
     const tarPath = tarFilesToTmp(tmpPath, fs.readdirSync(tmpPath))
     // cleanup the tmp export files as tarball returned
     fs.rmSync(tmpPath, { recursive: true, force: true })
+
     return tarPath
   }
   // tar not requested, turn the directory where export is
@@ -125,47 +174,26 @@ export async function exportApp(appId: string, config?: ExportOpts) {
 }
 
 /**
- * Export all apps + global DB (if supplied) to a single tarball, this includes
- * the attachments for each app as well.
- * @param {object[]} appMetadata The IDs and names of apps to export.
- * @param {string} globalDbContents The contents of the global DB to export as well.
- * @return {string} The path to the tarball.
- */
-export async function exportMultipleApps(
-  appMetadata: { appId: string; name: string }[],
-  globalDbContents?: string
-) {
-  const tmpPath = join(budibaseTempDir(), uuid())
-  fs.mkdirSync(tmpPath)
-  let exportPromises: Promise<void>[] = []
-  // export each app to a directory, then move it into the complete export
-  const exportAndMove = async (appId: string, appName: string) => {
-    const path = await exportApp(appId)
-    await fs.promises.rename(path, join(tmpPath, appName))
-  }
-  for (let metadata of appMetadata) {
-    exportPromises.push(exportAndMove(metadata.appId, metadata.name))
-  }
-  // wait for all exports to finish
-  await Promise.all(exportPromises)
-  // add the global DB contents
-  if (globalDbContents) {
-    fs.writeFileSync(join(tmpPath, GLOBAL_DB_EXPORT_FILE), globalDbContents)
-  }
-  const appNames = appMetadata.map(metadata => metadata.name)
-  const tarPath = tarFilesToTmp(tmpPath, [...appNames, GLOBAL_DB_EXPORT_FILE])
-  // clear up the tmp path now tarball generated
-  fs.rmSync(tmpPath, { recursive: true, force: true })
-  return tarPath
-}
-
-/**
  * Streams a backup of the database state for an app
  * @param {string} appId The ID of the app which is to be backed up.
  * @param {boolean} excludeRows Flag to state whether the export should include data.
+ * @param {string} encryptPassword password for encrypting the export.
  * @returns {*} a readable stream of the backup which is written in real time
  */
-export async function streamExportApp(appId: string, excludeRows: boolean) {
-  const tmpPath = await exportApp(appId, { excludeRows, tar: true })
+export async function streamExportApp({
+  appId,
+  excludeRows,
+  encryptPassword,
+}: {
+  appId: string
+  excludeRows: boolean
+  encryptPassword?: string
+}) {
+  const tmpPath = await exportApp(appId, {
+    excludeRows,
+    excludeLogs: true,
+    tar: true,
+    encryptPassword,
+  })
   return streamFile(tmpPath)
 }

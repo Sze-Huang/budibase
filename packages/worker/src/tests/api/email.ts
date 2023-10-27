@@ -1,12 +1,9 @@
 import TestConfiguration from "../TestConfiguration"
+import { TestAPI } from "./base"
 
-export class EmailAPI {
-  config: TestConfiguration
-  request: any
-
+export class EmailAPI extends TestAPI {
   constructor(config: TestConfiguration) {
-    this.config = config
-    this.request = config.request
+    super(config)
   }
 
   sendEmail = (purpose: string) => {
@@ -16,6 +13,7 @@ export class EmailAPI {
         email: "test@test.com",
         purpose,
         tenantId: this.config.getTenantId(),
+        userId: this.config.user?._id!,
       })
       .set(this.config.defaultHeaders())
       .expect("Content-Type", /json/)

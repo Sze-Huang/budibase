@@ -26,19 +26,20 @@
   } from "stores"
   import { Helpers } from "@budibase/bbui"
   import { getActiveConditions, reduceConditionActions } from "utils/conditions"
-  import Placeholder from "components/app/Placeholder.svelte"
+  import EmptyPlaceholder from "components/app/EmptyPlaceholder.svelte"
   import ScreenPlaceholder from "components/app/ScreenPlaceholder.svelte"
-  import ComponentPlaceholder from "components/app/ComponentPlaceholder.svelte"
+  import ComponentErrorState from "components/error-states/ComponentErrorState.svelte"
+  import { BudibasePrefix } from "../stores/components.js"
 
   export let instance = {}
   export let isLayout = false
-  export let isScreen = false
+  export let isRoot = false
   export let isBlock = false
-  export let parent = null
 
   // Get parent contexts
   const context = getContext("context")
   const insideScreenslot = !!getContext("screenslot")
+  const component = getContext("component")
 
   // Create component context
   const store = writable({})
@@ -70,6 +71,9 @@
   // These are a combination of the enriched, nested and conditional settings.
   let cachedSettings
 
+  // Conditional UI expressions, enriched and ready to evaluate
+  let conditions
+
   // Latest timestamp that we started a props update.
   // Due to enrichment now being async, we need to avoid overwriting newer
   // settings with old ones, depending on how long enrichment takes.
@@ -100,7 +104,7 @@
   // Extract component instance info
   $: children = instance._children || []
   $: id = instance._id
-  $: name = isScreen ? "Screen" : instance._instanceName
+  $: name = isRoot ? "Screen" : instance._instanceName
   $: icon = definition?.icon
 
   // Determine if the component is selected or is part of the critical path
@@ -117,19 +121,25 @@
   $: showEmptyState = definition?.showEmptyState !== false
   $: hasMissingRequiredSettings = missingRequiredSettings?.length > 0
   $: editable = !!definition?.editable && !hasMissingRequiredSettings
+  $: requiredAncestors = definition?.requiredAncestors || []
+  $: missingRequiredAncestors = requiredAncestors.filter(
+    ancestor => !$component.ancestors.includes(`${BudibasePrefix}${ancestor}`)
+  )
+  $: hasMissingRequiredAncestors = missingRequiredAncestors?.length > 0
+  $: errorState = hasMissingRequiredSettings || hasMissingRequiredAncestors
 
   // Interactive components can be selected, dragged and highlighted inside
   // the builder preview
   $: builderInteractive =
     $builderStore.inBuilder && insideScreenslot && !isBlock && !instance.static
   $: devToolsInteractive = $devToolsStore.allowSelection && !isBlock
-  $: interactive = builderInteractive || devToolsInteractive
+  $: interactive = !isRoot && (builderInteractive || devToolsInteractive)
   $: editing = editable && selected && $builderStore.editMode
   $: draggable =
     !inDragPath &&
     interactive &&
     !isLayout &&
-    !isScreen &&
+    !isRoot &&
     definition?.draggable !== false
   $: droppable = interactive
   $: builderHidden =
@@ -148,9 +158,7 @@
   $: enrichComponentSettings($context, settingsDefinitionMap)
 
   // Evaluate conditional UI settings and store any component setting changes
-  // which need to be made. This is broken into 2 lines to avoid svelte
-  // reactivity re-evaluating conditions more often than necessary.
-  $: conditions = enrichedSettings?._conditions
+  // which need to be made
   $: evaluateConditions(conditions)
 
   // Determine and apply settings to the component
@@ -182,16 +190,20 @@
       custom: customCSS,
       id,
       empty: emptyState,
+      selected,
       interactive,
       draggable,
       editable,
     },
     empty: emptyState,
     selected,
+    inSelectedPath,
     name,
     editing,
     type: instance._component,
-    missingRequiredSettings,
+    errorState,
+    parent: id,
+    ancestors: [...($component?.ancestors ?? []), instance._component],
   })
 
   const initialise = (instance, force = false) => {
@@ -260,9 +272,33 @@
       return missing
     })
 
+    // Run any migrations
+    runMigrations(instance, settingsDefinition)
+
     // Force an initial enrichment of the new settings
     enrichComponentSettings(get(context), settingsDefinitionMap, {
       force: true,
+    })
+  }
+
+  const runMigrations = (instance, settingsDefinition) => {
+    settingsDefinition.forEach(setting => {
+      // Migrate "table" settings to ensure they have a type and resource ID
+      if (setting.type === "table") {
+        const val = instance[setting.key]
+        if (val) {
+          if (!val.type) {
+            val.type = "table"
+          }
+          if (!val.resourceId) {
+            if (val.type === "viewV2") {
+              val.resourceId = val.id
+            } else {
+              val.resourceId = val.tableId
+            }
+          }
+        }
+      }
     })
   }
 
@@ -285,7 +321,7 @@
     let newStaticSettings = { ...settings }
     let newDynamicSettings = { ...settings }
 
-    // Attach some internal properties
+    // Attach some internal properties which we assume always need enriched
     newDynamicSettings["_conditions"] = instance._conditions
     newDynamicSettings["_css"] = instance._styles?.custom
 
@@ -324,6 +360,24 @@
     }
   }
 
+  // Generates the array of conditional UI expressions, accounting for both
+  // nested and non-nested settings, extracting a mixture of values from both
+  // the un-enriched and enriched settings
+  const generateConditions = () => {
+    if (!enrichedSettings?._conditions) {
+      conditions = []
+      return
+    }
+    conditions = enrichedSettings._conditions.map(condition => {
+      const raw = instance._conditions?.find(x => x.id === condition.id)
+      if (settingsDefinitionMap[condition.setting]?.nested && raw) {
+        return { ...condition, settingValue: raw.settingValue }
+      } else {
+        return condition
+      }
+    })
+  }
+
   // Enriches any string component props using handlebars
   const enrichComponentSettings = (
     context,
@@ -352,7 +406,11 @@
       return
     }
 
+    // Store new enriched settings
     enrichedSettings = newEnrichedSettings
+
+    // Once settings have been enriched, re-evaluate conditions
+    generateConditions()
   }
 
   // Evaluates the list of conditional UI conditions and determines any setting
@@ -441,7 +499,7 @@
     node.style.scrollMargin = "100px"
     node.scrollIntoView({
       behavior: "smooth",
-      block: "start",
+      block: "nearest",
       inline: "start",
     })
   }
@@ -458,6 +516,7 @@
         getDataContext: () => get(context),
         reload: () => initialise(instance, true),
         setEphemeralStyles: styles => (ephemeralStyles = styles),
+        state: store,
       })
     }
   })
@@ -485,28 +544,34 @@
     class:pad
     class:parent={hasChildren}
     class:block={isBlock}
+    class:error={errorState}
     data-id={id}
     data-name={name}
     data-icon={icon}
-    data-parent={parent}
+    data-parent={$component.id}
   >
-    <svelte:component this={constructor} bind:this={ref} {...initialSettings}>
-      {#if hasMissingRequiredSettings}
-        <ComponentPlaceholder />
-      {:else if children.length}
-        {#each children as child (child._id)}
-          <svelte:self instance={child} parent={id} />
-        {/each}
-      {:else if emptyState}
-        {#if isScreen}
-          <ScreenPlaceholder />
-        {:else}
-          <Placeholder />
+    {#if errorState}
+      <ComponentErrorState
+        {missingRequiredSettings}
+        {missingRequiredAncestors}
+      />
+    {:else}
+      <svelte:component this={constructor} bind:this={ref} {...initialSettings}>
+        {#if children.length}
+          {#each children as child (child._id)}
+            <svelte:self instance={child} />
+          {/each}
+        {:else if emptyState}
+          {#if isRoot}
+            <ScreenPlaceholder />
+          {:else}
+            <EmptyPlaceholder />
+          {/if}
+        {:else if isBlock}
+          <slot />
         {/if}
-      {:else if isBlock}
-        <slot />
-      {/if}
-    </svelte:component>
+      </svelte:component>
+    {/if}
   </div>
 {/if}
 

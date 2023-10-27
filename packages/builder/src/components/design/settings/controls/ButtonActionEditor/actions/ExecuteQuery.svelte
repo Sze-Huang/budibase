@@ -3,7 +3,10 @@
   import { datasources, integrations, queries } from "stores/backend"
   import BindingBuilder from "components/integration/QueryBindingBuilder.svelte"
   import IntegrationQueryEditor from "components/integration/index.svelte"
-  import { BUDIBASE_DATASOURCE_ID } from "constants/backend"
+  import {
+    BUDIBASE_INTERNAL_DB_ID,
+    BUDIBASE_DATASOURCE_TYPE,
+  } from "constants/backend"
 
   export let parameters
   export let bindings = []
@@ -14,8 +17,15 @@
   )
   // Executequery must exclude budibase datasource
   $: executeQueryDatasources = $datasources.list.filter(
-    x => x._id !== BUDIBASE_DATASOURCE_ID
+    x =>
+      x._id !== BUDIBASE_INTERNAL_DB_ID && x.type !== BUDIBASE_DATASOURCE_TYPE
   )
+  // Ensure query params exist so they can be bound
+  $: {
+    if (!parameters.queryParams) {
+      parameters.queryParams = {}
+    }
+  }
 
   function fetchQueryDefinition(query) {
     const source = $datasources.list.find(
@@ -44,7 +54,11 @@
       getOptionLabel={query => query.name}
       getOptionValue={query => query._id}
     />
-
+    <Checkbox
+      text="Do not display default notification"
+      bind:value={parameters.notificationOverride}
+    />
+    <br />
     {#if parameters.queryId}
       <Checkbox text="Require confirmation" bind:value={parameters.confirm} />
 
@@ -59,9 +73,12 @@
       {#if query?.parameters?.length > 0}
         <div class="params">
           <BindingBuilder
-            bind:customParams={parameters.queryParams}
+            customParams={parameters.queryParams}
             queryBindings={query.parameters}
             bind:bindings
+            on:change={v => {
+              parameters.queryParams = { ...v.detail }
+            }}
           />
           <IntegrationQueryEditor
             height={200}

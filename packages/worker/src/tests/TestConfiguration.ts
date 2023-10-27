@@ -1,73 +1,86 @@
-import "./mocks"
-import dbConfig from "../db"
+import mocks from "./mocks"
+
+// init the licensing mock
+mocks.licenses.init(mocks.pro)
+
+// use unlimited license by default
+mocks.licenses.useUnlimited()
+
+import * as dbConfig from "../db"
 dbConfig.init()
 import env from "../environment"
-import controllers from "./controllers"
+import * as controllers from "./controllers"
 const supertest = require("supertest")
-import { Configs } from "../constants"
+import { Config } from "../constants"
 import {
   users,
-  tenancy,
-  Cookies,
-  Headers,
+  context,
   sessions,
   auth,
+  constants,
+  env as coreEnv,
+  db as dbCore,
+  encryption,
+  utils,
 } from "@budibase/backend-core"
-import { TENANT_ID, TENANT_1, CSRF_TOKEN } from "./structures"
-import structures from "./structures"
-import { CreateUserResponse, User, AuthToken } from "@budibase/types"
-
-enum Mode {
-  ACCOUNT = "account",
-  SELF = "self",
-}
+import structures, { CSRF_TOKEN } from "./structures"
+import {
+  SaveUserResponse,
+  User,
+  AuthToken,
+  SCIMConfig,
+  ConfigType,
+} from "@budibase/types"
+import API from "./api"
 
 class TestConfiguration {
   server: any
   request: any
-  defaultUser?: User
-  tenant1User?: User
+  api: API
+  tenantId: string
+  user?: User
+  apiKey?: string
+  userPassword = "test"
 
-  constructor(
-    opts: { openServer: boolean; mode: Mode } = {
-      openServer: true,
-      mode: Mode.ACCOUNT,
-    }
-  ) {
-    if (opts.mode === Mode.ACCOUNT) {
-      this.modeAccount()
-    } else if (opts.mode === Mode.SELF) {
-      this.modeSelf()
-    }
+  constructor(opts: { openServer: boolean } = { openServer: true }) {
+    // default to cloud hosting
+    this.cloudHosted()
+
+    this.tenantId = structures.tenant.id()
 
     if (opts.openServer) {
       env.PORT = "0" // random port
-      this.server = require("../index")
+      this.server = require("../index").default
       // we need the request for logging in, involves cookies, hard to fake
       this.request = supertest(this.server)
     }
+
+    this.api = new API(this)
+  }
+
+  async useNewTenant() {
+    this.tenantId = structures.tenant.id()
+
+    await this.beforeAll()
   }
 
   getRequest() {
     return this.request
   }
 
-  // MODES
+  // HOSTING
 
-  modeAccount = () => {
-    env.SELF_HOSTED = false
-    // @ts-ignore
-    env.MULTI_TENANCY = true
-    // @ts-ignore
-    env.DISABLE_ACCOUNT_PORTAL = false
+  setSelfHosted = (value: boolean) => {
+    env._set("SELF_HOSTED", value)
+    coreEnv._set("SELF_HOSTED", value)
   }
 
-  modeSelf = () => {
-    env.SELF_HOSTED = true
-    // @ts-ignore
-    env.MULTI_TENANCY = false
-    // @ts-ignore
-    env.DISABLE_ACCOUNT_PORTAL = true
+  cloudHosted = () => {
+    this.setSelfHosted(false)
+  }
+
+  selfHosted = () => {
+    this.setSelfHosted(true)
   }
 
   // UTILS
@@ -76,7 +89,6 @@ class TestConfiguration {
     const request: any = {}
     // fake cookies, we don't need them
     request.cookies = { set: () => {}, get: () => {} }
-    request.config = { jwtSecret: env.JWT_SECRET }
     request.user = { tenantId: this.getTenantId() }
     request.query = {}
     request.request = {
@@ -88,7 +100,7 @@ class TestConfiguration {
     if (params) {
       request.params = params
     }
-    await tenancy.doInTenant(this.getTenantId(), () => {
+    await context.doInTenant(this.getTenantId(), () => {
       return controlFunc(request)
     })
     return request.body
@@ -97,60 +109,84 @@ class TestConfiguration {
   // SETUP / TEARDOWN
 
   async beforeAll() {
-    await this.createDefaultUser()
-    await this.createSession(this.defaultUser!)
-
-    await tenancy.doInTenant(TENANT_1, async () => {
-      await this.createTenant1User()
-      await this.createSession(this.tenant1User!)
-    })
+    try {
+      await this.createDefaultUser()
+      await this.createSession(this.user!)
+    } catch (e: any) {
+      console.error(e)
+      throw new Error(e.message)
+    }
   }
 
   async afterAll() {
     if (this.server) {
       await this.server.close()
+    } else {
+      await require("../index").default.close()
     }
   }
 
   // TENANCY
 
+  doInTenant(task: any) {
+    return context.doInTenant(this.tenantId, () => {
+      return task()
+    })
+  }
+
+  createTenant = async (): Promise<User> => {
+    // create user / new tenant
+    const res = await this.api.users.createAdminUser()
+
+    // return the created user
+    const userRes = await this.api.users.getUser(res.userId, {
+      headers: {
+        ...this.internalAPIHeaders(),
+        [constants.Header.TENANT_ID]: res.tenantId,
+      },
+    })
+
+    // create a session for the new user
+    const user = userRes.body
+    await this.createSession(user)
+
+    return user
+  }
+
   getTenantId() {
     try {
-      return tenancy.getTenantId()
-    } catch (e: any) {
-      return TENANT_ID
+      return context.getTenantId()
+    } catch (e) {
+      return this.tenantId!
     }
   }
 
-  // USER / AUTH
+  // AUTH
 
-  async createDefaultUser() {
-    const user = structures.users.adminUser({
-      email: "test@test.com",
-      password: "test",
-    })
-    this.defaultUser = await this.createUser(user)
-  }
-
-  async createTenant1User() {
-    const user = structures.users.adminUser({
-      email: "tenant1@test.com",
-      password: "test",
-    })
-    this.tenant1User = await this.createUser(user)
-  }
-
-  async createSession(user: User) {
-    await sessions.createASession(user._id!, {
+  async _createSession({
+    userId,
+    tenantId,
+  }: {
+    userId: string
+    tenantId: string
+  }) {
+    await sessions.createASession(userId!, {
       sessionId: "sessionid",
-      tenantId: user.tenantId,
+      tenantId: tenantId,
       csrfToken: CSRF_TOKEN,
     })
   }
 
+  async createSession(user: User) {
+    return this._createSession({ userId: user._id!, tenantId: user.tenantId })
+  }
+
   cookieHeader(cookies: any) {
+    if (!Array.isArray(cookies)) {
+      cookies = [cookies]
+    }
     return {
-      Cookie: [cookies],
+      Cookie: cookies,
     }
   }
 
@@ -160,28 +196,64 @@ class TestConfiguration {
       sessionId: "sessionid",
       tenantId: user.tenantId,
     }
-    const authCookie = auth.jwt.sign(authToken, env.JWT_SECRET)
+    const authCookie = auth.jwt.sign(authToken, coreEnv.JWT_SECRET)
     return {
       Accept: "application/json",
-      ...this.cookieHeader([`${Cookies.Auth}=${authCookie}`]),
-      [Headers.CSRF_TOKEN]: CSRF_TOKEN,
+      ...this.cookieHeader([`${constants.Cookie.Auth}=${authCookie}`]),
+      [constants.Header.CSRF_TOKEN]: CSRF_TOKEN,
     }
   }
 
   defaultHeaders() {
-    const tenantId = this.getTenantId()
-    if (tenantId === TENANT_ID) {
-      return this.authHeaders(this.defaultUser!)
-    } else if (tenantId === TENANT_1) {
-      return this.authHeaders(this.tenant1User!)
-    } else {
-      throw new Error("could not determine auth headers to use")
+    return this.authHeaders(this.user!)
+  }
+
+  tenantIdHeaders() {
+    return { [constants.Header.TENANT_ID]: this.tenantId }
+  }
+
+  internalAPIHeaders() {
+    return { [constants.Header.API_KEY]: coreEnv.INTERNAL_API_KEY }
+  }
+
+  bearerAPIHeaders() {
+    return {
+      [constants.Header.AUTHORIZATION]: `Bearer ${this.apiKey}`,
     }
   }
 
+  adminOnlyResponse = () => {
+    return { message: "Admin user only endpoint.", status: 403 }
+  }
+
+  // USERS
+
+  async createDefaultUser() {
+    const user = structures.users.adminUser({
+      password: this.userPassword,
+    })
+    await context.doInTenant(this.tenantId!, async () => {
+      this.user = await this.createUser(user)
+
+      const db = context.getGlobalDB()
+
+      const id = dbCore.generateDevInfoID(this.user!._id)
+      // TODO: dry
+      this.apiKey = encryption.encrypt(
+        `${this.tenantId}${dbCore.SEPARATOR}${utils.newid()}`
+      )
+      const devInfo = {
+        _id: id,
+        userId: this.user!._id,
+        apiKey: this.apiKey,
+      }
+      await db.put(devInfo)
+    })
+  }
+
   async getUser(email: string): Promise<User> {
-    return tenancy.doInTenant(this.getTenantId(), () => {
-      return users.getGlobalUserByEmail(email)
+    return context.doInTenant(this.getTenantId(), async () => {
+      return (await users.getGlobalUserByEmail(email)) as User
     })
   }
 
@@ -190,8 +262,8 @@ class TestConfiguration {
       user = structures.users.user()
     }
     const response = await this._req(user, null, controllers.users.save)
-    const body = response as CreateUserResponse
-    return this.getUser(body.email)
+    const body = response as SaveUserResponse
+    return (await this.getUser(body.email)) as User
   }
 
   // CONFIGS
@@ -223,7 +295,7 @@ class TestConfiguration {
   // CONFIGS - SETTINGS
 
   async saveSettingsConfig() {
-    await this.deleteConfig(Configs.SETTINGS)
+    await this.deleteConfig(Config.SETTINGS)
     await this._req(
       structures.configs.settings(),
       null,
@@ -234,19 +306,19 @@ class TestConfiguration {
   // CONFIGS - GOOGLE
 
   async saveGoogleConfig() {
-    await this.deleteConfig(Configs.GOOGLE)
+    await this.deleteConfig(Config.GOOGLE)
     await this._req(structures.configs.google(), null, controllers.config.save)
   }
 
   // CONFIGS - OIDC
 
   getOIDConfigCookie(configId: string) {
-    const token = auth.jwt.sign(configId, env.JWT_SECRET)
-    return this.cookieHeader([[`${Cookies.OIDC_CONFIG}=${token}`]])
+    const token = auth.jwt.sign(configId, coreEnv.JWT_SECRET)
+    return this.cookieHeader([[`${constants.Cookie.OIDC_CONFIG}=${token}`]])
   }
 
   async saveOIDCConfig() {
-    await this.deleteConfig(Configs.OIDC)
+    await this.deleteConfig(Config.OIDC)
     const config = structures.configs.oidc()
 
     await this._req(config, null, controllers.config.save)
@@ -256,18 +328,31 @@ class TestConfiguration {
   // CONFIGS - SMTP
 
   async saveSmtpConfig() {
-    await this.deleteConfig(Configs.SMTP)
+    await this.deleteConfig(Config.SMTP)
     await this._req(structures.configs.smtp(), null, controllers.config.save)
   }
 
   async saveEtherealSmtpConfig() {
-    await this.deleteConfig(Configs.SMTP)
+    await this.deleteConfig(Config.SMTP)
     await this._req(
       structures.configs.smtpEthereal(),
       null,
       controllers.config.save
     )
   }
+
+  // CONFIGS - SCIM
+
+  async setSCIMConfig(enabled: boolean) {
+    await this.deleteConfig(Config.SCIM)
+    const config: SCIMConfig = {
+      type: ConfigType.SCIM,
+      config: { enabled },
+    }
+
+    await this._req(config, null, controllers.config.save)
+    return config
+  }
 }
 
-export = TestConfiguration
+export default TestConfiguration

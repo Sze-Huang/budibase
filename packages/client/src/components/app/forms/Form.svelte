@@ -2,12 +2,14 @@
   import { getContext } from "svelte"
   import InnerForm from "./InnerForm.svelte"
   import { Helpers } from "@budibase/bbui"
+  import { writable } from "svelte/store"
 
   export let dataSource
   export let theme
   export let size
   export let disabled = false
   export let actionType = "Create"
+  export let initialFormStep = 1
 
   // Not exposed as a builder setting. Used internally to disable validation
   // for fields rendered in things like search blocks.
@@ -20,12 +22,25 @@
   const context = getContext("context")
   const { API, fetchDatasourceSchema } = getContext("sdk")
 
+  const getInitialFormStep = () => {
+    const parsedFormStep = parseInt(initialFormStep)
+    if (isNaN(parsedFormStep)) {
+      return 1
+    }
+    return parsedFormStep
+  }
+
   let loaded = false
   let schema
   let table
+  let currentStep = writable(getInitialFormStep())
 
   $: fetchSchema(dataSource)
-  $: fetchTable(dataSource)
+  $: schemaKey = generateSchemaKey(schema)
+  $: initialValues = getInitialValues(actionType, dataSource, $context)
+  $: resetKey = Helpers.hashString(
+    schemaKey + JSON.stringify(initialValues) + disabled
+  )
 
   // Returns the closes data context which isn't a built in context
   const getInitialValues = (type, dataSource, context) => {
@@ -48,13 +63,6 @@
 
   // Fetches the form schema from this form's dataSource
   const fetchSchema = async dataSource => {
-    schema = (await fetchDatasourceSchema(dataSource)) || {}
-    if (!loaded) {
-      loaded = true
-    }
-  }
-
-  const fetchTable = async dataSource => {
     if (dataSource?.tableId && dataSource?.type !== "query") {
       try {
         table = await API.fetchTableDefinition(dataSource.tableId)
@@ -62,12 +70,24 @@
         table = null
       }
     }
+    const res = await fetchDatasourceSchema(dataSource)
+    schema = res || {}
+    if (!loaded) {
+      loaded = true
+    }
   }
 
-  $: initialValues = getInitialValues(actionType, dataSource, $context)
-  $: resetKey = Helpers.hashString(
-    JSON.stringify(initialValues) + JSON.stringify(schema) + disabled
-  )
+  // Generates a predictable string that uniquely identifies a schema. We can't
+  // simply stringify the whole schema as there are array fields which have
+  // random order.
+  const generateSchemaKey = schema => {
+    if (!schema) {
+      return null
+    }
+    const fields = Object.keys(schema)
+    fields.sort()
+    return fields.map(field => `${field}:${schema[field].type}`).join("-")
+  }
 </script>
 
 {#if loaded}
@@ -83,6 +103,7 @@
       {initialValues}
       {disableValidation}
       {editAutoColumns}
+      {currentStep}
     >
       <slot />
     </InnerForm>

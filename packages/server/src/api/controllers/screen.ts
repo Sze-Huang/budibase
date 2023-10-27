@@ -7,9 +7,10 @@ import {
   roles,
 } from "@budibase/backend-core"
 import { updateAppPackage } from "./application"
-import { Plugin, ScreenProps } from "@budibase/types"
+import { Plugin, ScreenProps, BBContext, Screen } from "@budibase/types"
+import { builderSocket } from "../../websockets"
 
-exports.fetch = async (ctx: any) => {
+export async function fetch(ctx: BBContext) {
   const db = context.getAppDB()
 
   const screens = (
@@ -20,13 +21,17 @@ exports.fetch = async (ctx: any) => {
     )
   ).rows.map((el: any) => el.doc)
 
+  const roleId = ctx.user?.role?._id as string
+  if (!roleId) {
+    ctx.throw("Unable to retrieve users role ID.")
+  }
   ctx.body = await new roles.AccessController().checkScreensAccess(
     screens,
-    ctx.user.role._id
+    roleId
   )
 }
 
-exports.save = async (ctx: any) => {
+export async function save(ctx: BBContext) {
   const db = context.getAppDB()
   let screen = ctx.request.body
 
@@ -59,7 +64,7 @@ exports.save = async (ctx: any) => {
       })
 
     // Update the app metadata
-    const application = await db.get(DocumentType.APP_METADATA)
+    const application = await db.get<any>(DocumentType.APP_METADATA)
     let usedPlugins = application.usedPlugins || []
 
     requiredPlugins.forEach((plugin: Plugin) => {
@@ -83,19 +88,23 @@ exports.save = async (ctx: any) => {
   if (eventFn) {
     await eventFn(screen)
   }
-  ctx.message = `Screen ${screen.name} saved.`
-  ctx.body = {
+  const savedScreen = {
     ...screen,
     _id: response.id,
     _rev: response.rev,
+  }
+  ctx.message = `Screen ${screen.name} saved.`
+  ctx.body = {
+    ...savedScreen,
     pluginAdded,
   }
+  builderSocket?.emitScreenUpdate(ctx, savedScreen)
 }
 
-exports.destroy = async (ctx: any) => {
+export async function destroy(ctx: BBContext) {
   const db = context.getAppDB()
   const id = ctx.params.screenId
-  const screen = await db.get(id)
+  const screen = await db.get<Screen>(id)
 
   await db.remove(id, ctx.params.screenRev)
 
@@ -104,9 +113,10 @@ exports.destroy = async (ctx: any) => {
     message: "Screen deleted successfully",
   }
   ctx.status = 200
+  builderSocket?.emitScreenDeletion(ctx, id)
 }
 
-const findPlugins = (component: ScreenProps, foundPlugins: string[]) => {
+function findPlugins(component: ScreenProps, foundPlugins: string[]) {
   if (!component) {
     return
   }

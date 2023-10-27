@@ -1,16 +1,23 @@
-import { getAppDB } from "@budibase/backend-core/context"
+import { context } from "@budibase/backend-core"
 import { BudibaseInternalDB, getTableParams } from "../../../db/utils"
 import {
   breakExternalTableId,
   isExternalTable,
   isSQL,
 } from "../../../integrations/utils"
-import { Table } from "@budibase/types"
-import PouchDB from "pouchdb"
+import {
+  Database,
+  Table,
+  TableResponse,
+  TableViewsResponse,
+} from "@budibase/types"
+import datasources from "../datasources"
+import { populateExternalTableSchemas } from "./validation"
+import sdk from "../../../sdk"
 
-async function getAllInternalTables(db?: PouchDB.Database): Promise<Table[]> {
+async function getAllInternalTables(db?: Database): Promise<Table[]> {
   if (!db) {
-    db = getAppDB() as PouchDB.Database
+    db = context.getAppDB()
   }
   const internalTables = await db.allDocs(
     getTableParams(null, {
@@ -20,13 +27,14 @@ async function getAllInternalTables(db?: PouchDB.Database): Promise<Table[]> {
   return internalTables.rows.map((tableDoc: any) => ({
     ...tableDoc.doc,
     type: "internal",
-    sourceId: BudibaseInternalDB._id,
+    sourceId: tableDoc.doc.sourceId || BudibaseInternalDB._id,
   }))
 }
 
-async function getAllExternalTables(datasourceId: any): Promise<Table[]> {
-  const db = getAppDB()
-  const datasource = await db.get(datasourceId)
+async function getAllExternalTables(
+  datasourceId: any
+): Promise<Record<string, Table>> {
+  const datasource = await datasources.get(datasourceId, { enriched: true })
   if (!datasource || !datasource.entities) {
     throw "Datasource is not configured fully."
   }
@@ -42,14 +50,37 @@ async function getExternalTable(
 }
 
 async function getTable(tableId: any): Promise<Table> {
-  const db = getAppDB()
+  const db = context.getAppDB()
   if (isExternalTable(tableId)) {
     let { datasourceId, tableName } = breakExternalTableId(tableId)
-    const datasource = await db.get(datasourceId)
+    const datasource = await datasources.get(datasourceId!)
     const table = await getExternalTable(datasourceId, tableName)
     return { ...table, sql: isSQL(datasource) }
   } else {
     return db.get(tableId)
+  }
+}
+
+function enrichViewSchemas(table: Table): TableResponse {
+  return {
+    ...table,
+    views: Object.values(table.views ?? [])
+      .map(v => sdk.views.enrichSchema(v, table.schema))
+      .reduce((p, v) => {
+        p[v.name] = v
+        return p
+      }, {} as TableViewsResponse),
+  }
+}
+
+async function saveTable(table: Table) {
+  const db = context.getAppDB()
+  if (isExternalTable(table._id!)) {
+    const datasource = await sdk.datasources.get(table.sourceId!)
+    datasource.entities![table.name] = table
+    await db.put(datasource)
+  } else {
+    await db.put(table)
   }
 }
 
@@ -58,4 +89,7 @@ export default {
   getAllExternalTables,
   getExternalTable,
   getTable,
+  populateExternalTableSchemas,
+  enrichViewSchemas,
+  saveTable,
 }
